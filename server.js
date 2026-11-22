@@ -17,6 +17,34 @@ const HIDDEN_FILE = path.join(DATA_DIR, "hidden-sessions.json");
 const SNIPPETS_FILE = path.join(DATA_DIR, "snippets.json");
 const TRANSLATE_CACHE_FILE = path.join(DATA_DIR, "thought-translations.json");
 const PREFS_FILE = path.join(DATA_DIR, "preferences.json");
+const UPLOADS_DIR = path.join(DATA_DIR, "uploads");
+
+function saveUploadedImage(base64Data, mimeType, idx = 0) {
+  try {
+    if (!fs.existsSync(UPLOADS_DIR)) {
+      fs.mkdirSync(UPLOADS_DIR, { recursive: true });
+    }
+    const extMap = {
+      "image/png": "png",
+      "image/jpeg": "jpg",
+      "image/jpg": "jpg",
+      "image/webp": "webp",
+      "image/gif": "gif",
+      "image/bmp": "bmp",
+    };
+    const ext = extMap[String(mimeType || "").toLowerCase()] || "png";
+    const fileName = `img-${Date.now()}-${idx}-${Math.random().toString(36).slice(2, 6)}.${ext}`;
+    const fullPath = path.join(UPLOADS_DIR, fileName);
+    const buf = Buffer.from(String(base64Data || ""), "base64");
+    if (buf.length > 0) {
+      fs.writeFileSync(fullPath, buf);
+      return fullPath;
+    }
+  } catch (e) {
+    console.error("[uploads] save image failed:", e.message);
+  }
+  return null;
+}
 
 function loadPreferences() {
   try {
@@ -1543,18 +1571,38 @@ class AcpBridge {
       throw new Error("当前会话正在生成回复，你可以切换到其他会话并行发任务，或先点击停止。");
     }
 
-    const promptBlocks = [];
-    if (text && text.trim()) {
-      promptBlocks.push({ type: "text", text });
-    }
-    for (const img of images) {
+    const savedPaths = [];
+    const normalizedImages = [];
+    for (let i = 0; i < images.length; i++) {
+      const img = images[i];
       if (img && img.data && img.mimeType) {
-        promptBlocks.push({
-          type: "image",
-          data: img.data,
+        const savedPath = saveUploadedImage(img.data, img.mimeType, i);
+        if (savedPath) savedPaths.push(savedPath);
+        normalizedImages.push({
           mimeType: img.mimeType,
+          data: img.data,
+          savedPath,
         });
       }
+    }
+
+    const promptBlocks = [];
+    let finalText = text ? String(text) : "";
+    if (savedPaths.length > 0) {
+      const note = savedPaths
+        .map((p, idx) => `[用户附带了图片 #${idx + 1}，已自动保存至本机路径: ${p}（可使用 read_file 查看图片内容，或直接复制/处理该文件）]`)
+        .join("\n");
+      finalText = finalText.trim() ? `${finalText.trim()}\n\n${note}` : note;
+    }
+    if (finalText.trim()) {
+      promptBlocks.push({ type: "text", text: finalText });
+    }
+    for (const img of normalizedImages) {
+      promptBlocks.push({
+        type: "image",
+        data: img.data,
+        mimeType: img.mimeType,
+      });
     }
     if (promptBlocks.length === 0) {
       throw new Error("消息内容不能为空");
@@ -1565,8 +1613,9 @@ class AcpBridge {
       id: "usr-" + Date.now() + "-" + Math.random().toString(36).slice(2, 7),
       kind: "user",
       text: text || "",
-      images: images.map((im) => ({
+      images: normalizedImages.map((im) => ({
         mimeType: im.mimeType,
+        savedPath: im.savedPath || "",
         preview: `data:${im.mimeType};base64,${im.data}`,
       })),
       createdAt: new Date().toISOString(),

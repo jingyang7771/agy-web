@@ -5,7 +5,7 @@
 ![Zero Dependencies](https://img.shields.io/badge/dependencies-0-brightgreen)
 ![Node.js](https://img.shields.io/badge/node-%3E%3D18.0.0-blue)
 ![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-lightgrey)
-![Version](https://img.shields.io/badge/version-v1.0.1-orange)
+![Version](https://img.shields.io/badge/version-v1.0.2-orange)
 
 ---
 
