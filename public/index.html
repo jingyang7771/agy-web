@@ -1970,41 +1970,107 @@
     const translatingTexts = new Set();
     const translateQueue = [];
     let activeTranslates = 0;
+    let autoTranslateBackoffUntil = 0;
+    let translatePumpTimer = null;
+
+    // Lazy-translate only English thoughts actually visible in the scroll viewport (prevents 429 burst on long history!)
+    const thoughtItemByEl = new WeakMap();
+    const thoughtObserver =
+      typeof IntersectionObserver !== "undefined"
+        ? new IntersectionObserver(
+            (entries) => {
+              for (const entry of entries) {
+                if (!entry.isIntersecting) continue;
+                const el = entry.target;
+                const item = thoughtItemByEl.get(el);
+                thoughtObserver.unobserve(el);
+                if (!item || !state.autoTranslateThought) continue;
+                if (el.classList.contains("collapsed")) continue;
+                requestThoughtTranslation(item, false);
+              }
+            },
+            { root: chatScroll, rootMargin: "160px 0px" }
+          )
+        : null;
+
+    function schedulePumpTranslate(delayMs = 0) {
+      if (translatePumpTimer) return;
+      translatePumpTimer = setTimeout(() => {
+        translatePumpTimer = null;
+        pumpTranslateQueue();
+      }, delayMs);
+    }
 
     function pumpTranslateQueue() {
-      while (activeTranslates < 2 && translateQueue.length > 0) {
-        const { item, manual } = translateQueue.shift();
-        const raw = (item.text || "").trim();
-        if (!raw || thoughtTranslations.has(raw) || translatingTexts.has(raw)) continue;
-        translatingTexts.add(raw);
-        activeTranslates++;
-        if (state.items.some((x) => x.id === item.id)) updateSingleItemDom(item);
-        api("/api/translate", "POST", { text: raw })
-          .then((res) => {
-            if (res.translated) {
-              thoughtTranslations.set(raw, res.translated);
-            }
-          })
-          .catch((e) => {
-            if (manual) showToast("翻译失败: " + e.message, true);
-            else console.warn("[translate] failed:", e.message);
-          })
-          .finally(() => {
-            translatingTexts.delete(raw);
-            activeTranslates--;
-            if (state.items.some((x) => x.id === item.id)) {
-              updateSingleItemDom(item);
-            }
-            pumpTranslateQueue();
-          });
+      if (activeTranslates >= 1 || translateQueue.length === 0) return;
+
+      // Pick first eligible item (manual clicks bypass auto backoff)
+      const now = Date.now();
+      const idx = translateQueue.findIndex((q) => q.manual || now >= autoTranslateBackoffUntil);
+      if (idx < 0) {
+        schedulePumpTranslate(Math.max(500, autoTranslateBackoffUntil - now));
+        return;
       }
+
+      const { item, manual } = translateQueue.splice(idx, 1)[0];
+      const raw = (item.text || "").trim();
+      if (!raw || thoughtTranslations.has(raw) || translatingTexts.has(raw)) {
+        pumpTranslateQueue();
+        return;
+      }
+      if (!manual && !state.items.some((x) => x.id === item.id)) {
+        pumpTranslateQueue();
+        return;
+      }
+
+      translatingTexts.add(raw);
+      activeTranslates++;
+      let wasCached = false;
+      if (state.items.some((x) => x.id === item.id)) updateSingleItemDom(item);
+      api("/api/translate", "POST", { text: raw })
+        .then((res) => {
+          wasCached = !!res.cached;
+          if (res.translated) {
+            thoughtTranslations.set(raw, res.translated);
+          }
+        })
+        .catch((e) => {
+          if (/429|限流|冷却/.test(String(e.message || ""))) {
+            autoTranslateBackoffUntil = Date.now() + 20000;
+          }
+          if (manual) showToast("翻译失败: " + e.message, true);
+          else console.warn("[translate] failed:", e.message);
+        })
+        .finally(() => {
+          translatingTexts.delete(raw);
+          activeTranslates--;
+          if (state.items.some((x) => x.id === item.id)) {
+            updateSingleItemDom(item);
+          }
+          schedulePumpTranslate(wasCached ? 20 : 280);
+        });
     }
 
     function requestThoughtTranslation(item, manual = false) {
       const raw = (item.text || "").trim();
       if (!raw || thoughtTranslations.has(raw) || translatingTexts.has(raw)) return;
-      if (translateQueue.some((q) => (q.item.text || "").trim() === raw)) return;
-      translateQueue.push({ item, manual });
+      if (translateQueue.some((q) => (q.item.text || "").trim() === raw)) {
+        if (manual) {
+          const idx = translateQueue.findIndex((q) => (q.item.text || "").trim() === raw);
+          if (idx >= 0) {
+            const [entry] = translateQueue.splice(idx, 1);
+            entry.manual = true;
+            translateQueue.unshift(entry);
+            pumpTranslateQueue();
+          }
+        }
+        return;
+      }
+      if (manual) {
+        translateQueue.unshift({ item, manual: true });
+      } else {
+        translateQueue.push({ item, manual: false });
+      }
       pumpTranslateQueue();
     }
 
@@ -2500,8 +2566,13 @@
         const showOrig = !!thoughtShowOriginal.get(item.id);
         const showingTranslated = !!(translatedText && !showOrig);
 
-        if (canTranslate && state.autoTranslateThought && !translatedText && !isTranslating) {
-          queueMicrotask(() => requestThoughtTranslation(item));
+        if (canTranslate && state.autoTranslateThought && !translatedText && !isTranslating && !isCollapsed) {
+          if (thoughtObserver) {
+            thoughtItemByEl.set(el, item);
+            queueMicrotask(() => thoughtObserver.observe(el));
+          } else {
+            queueMicrotask(() => requestThoughtTranslation(item));
+          }
         }
 
         let trBtnHtml = "";
@@ -2562,6 +2633,9 @@
           el.classList.toggle("collapsed", nowCollapsed);
           const spans = el.querySelectorAll(".thought-header > .thought-meta");
           if (spans[0]) spans[0].textContent = nowCollapsed ? "展开 ▾" : "收起 ▴";
+          if (!nowCollapsed && canTranslate && state.autoTranslateThought && !translatedText && !isTranslating) {
+            requestThoughtTranslation(item, false);
+          }
         });
         return el;
       }
@@ -3538,6 +3612,9 @@
     }
 
     function applySnapshot(snap, forceScroll = false) {
+      if (snap.sessionId && snap.sessionId !== state.sessionId) {
+        translateQueue.length = 0;
+      }
       state.ready = !!snap.ready;
       if (typeof snap.sandbox === "boolean") state.sandbox = snap.sandbox;
       state.cwd = snap.cwd || state.cwd;

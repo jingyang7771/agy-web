@@ -177,34 +177,110 @@ function httpsGetText(targetUrl, timeoutMs = 10000) {
   });
 }
 
-async function translateChunkFree(chunk) {
-  // Primary: Google Translate lightweight public endpoint (0 LLM tokens)
-  try {
-    const gUrl = `https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl=zh-CN&dt=t&q=${encodeURIComponent(chunk)}`;
-    const body = await httpsGetText(gUrl, 10000);
-    const data = JSON.parse(body);
-    if (Array.isArray(data) && Array.isArray(data[0])) {
-      const joined = data[0].map((seg) => (Array.isArray(seg) ? seg[0] : "")).join("");
-      if (joined.trim()) return joined.trim();
-    }
-  } catch (e) {
-    // Fallback: MyMemory free endpoint (split into <=450 char slices so nothing is ever truncated)
-    try {
-      const slices = splitTextByLimit(chunk, 450);
-      const out = [];
-      for (const sl of slices) {
-        const mUrl = `https://api.mymemory.translated.net/get?q=${encodeURIComponent(sl)}&langpair=en|zh-CN`;
-        const body = await httpsGetText(mUrl, 10000);
-        const data = JSON.parse(body);
-        const t = data?.responseData?.translatedText;
-        if (t && t.trim()) out.push(t.trim());
-        else out.push(sl);
-      }
-      if (out.length) return out.join("\n");
-    } catch (_) {}
-    throw e;
+const translateProviderCooldown = {
+  clients5: 0,
+  gtx: 0,
+  mymemory: 0,
+};
+const inflightTranslations = new Map();
+let lastExternalTranslateAt = 0;
+
+async function throttleExternalTranslate(minGapMs = 350) {
+  const now = Date.now();
+  const wait = lastExternalTranslateAt + minGapMs - now;
+  if (wait > 0) {
+    await new Promise((r) => setTimeout(r, wait));
   }
-  throw new Error("翻译接口返回空结果");
+  lastExternalTranslateAt = Date.now();
+}
+
+function isRateLimitError(err) {
+  const msg = String(err?.message || err || "");
+  return /HTTP\s*(429|403|503)|MYMEMORY WARNING|too many requests|Sorry\.\.\./i.test(msg);
+}
+
+async function translateViaClients5(chunk) {
+  const url = `https://clients5.google.com/translate_a/t?client=dict-chrome-ex&sl=auto&tl=zh-CN&q=${encodeURIComponent(chunk)}`;
+  const body = await httpsGetText(url, 10000);
+  const data = JSON.parse(body);
+  if (Array.isArray(data)) {
+    if (typeof data[0] === "string" && data[0].trim()) return data[0].trim();
+    if (Array.isArray(data[0]) && typeof data[0][0] === "string" && data[0][0].trim()) {
+      return data[0][0].trim();
+    }
+    const joined = data
+      .map((item) => (typeof item === "string" ? item : Array.isArray(item) ? item[0] : ""))
+      .filter(Boolean)
+      .join("");
+    if (joined.trim()) return joined.trim();
+  }
+  throw new Error("clients5 返回空结果");
+}
+
+async function translateViaGtx(chunk) {
+  const gUrl = `https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl=zh-CN&dt=t&q=${encodeURIComponent(chunk)}`;
+  const body = await httpsGetText(gUrl, 10000);
+  const data = JSON.parse(body);
+  if (Array.isArray(data) && Array.isArray(data[0])) {
+    const joined = data[0].map((seg) => (Array.isArray(seg) ? seg[0] : "")).join("");
+    if (joined.trim()) return joined.trim();
+  }
+  throw new Error("gtx 返回空结果");
+}
+
+async function translateViaMyMemory(chunk) {
+  const slices = splitTextByLimit(chunk, 450);
+  const out = [];
+  for (const sl of slices) {
+    await throttleExternalTranslate(350);
+    const mUrl = `https://api.mymemory.translated.net/get?q=${encodeURIComponent(sl)}&langpair=en|zh-CN`;
+    const body = await httpsGetText(mUrl, 10000);
+    const data = JSON.parse(body);
+    const t = String(data?.responseData?.translatedText || "").trim();
+    if (!t || /MYMEMORY WARNING/i.test(t) || data?.responseStatus === 429) {
+      throw new Error("HTTP 429: MyMemory 免费日额度已用完");
+    }
+    out.push(t);
+  }
+  if (out.length) return out.join("\n");
+  throw new Error("MyMemory 返回空结果");
+}
+
+async function translateChunkFree(chunk) {
+  const now = Date.now();
+  const providers = [
+    { key: "clients5", cooldownMs: 5 * 60 * 1000, fn: translateViaClients5 },
+    { key: "gtx", cooldownMs: 5 * 60 * 1000, fn: translateViaGtx },
+    { key: "mymemory", cooldownMs: 10 * 60 * 1000, fn: translateViaMyMemory },
+  ];
+
+  let lastErr = null;
+  let rateLimitedAll = true;
+  let attempted = 0;
+
+  for (const p of providers) {
+    if (translateProviderCooldown[p.key] > now) {
+      continue;
+    }
+    attempted++;
+    try {
+      await throttleExternalTranslate(350);
+      const res = await p.fn(chunk);
+      if (res && res.trim()) return res.trim();
+    } catch (e) {
+      lastErr = e;
+      if (isRateLimitError(e)) {
+        translateProviderCooldown[p.key] = Date.now() + p.cooldownMs;
+      } else {
+        rateLimitedAll = false;
+      }
+    }
+  }
+
+  if (attempted === 0 || rateLimitedAll) {
+    throw new Error("免费翻译接口触发限流冷却中（429），请稍候再点「🌐 译为中文」重试，或开启浏览器自带翻译");
+  }
+  throw new Error("翻译请求暂时失败：" + String(lastErr?.message || "请稍后重试").replace(/<[^>]+>/g, "").slice(0, 120));
 }
 
 function splitTextByLimit(text, limit = 850) {
@@ -250,38 +326,50 @@ async function translateThoughtToZh(rawText) {
   if (translateCache[hash]) {
     return { translated: translateCache[hash], cached: true };
   }
+  if (inflightTranslations.has(hash)) {
+    return inflightTranslations.get(hash);
+  }
 
-  // Split long text safely into <=850 char batches (handling single giant paragraphs too)
-  const paras = text.replace(/\r\n/g, "\n").split(/\n{2,}/);
-  const batches = [];
-  let cur = "";
-  for (const p of paras) {
-    const part = p.trim();
-    if (!part) continue;
-    if (part.length > 850) {
-      if (cur) {
+  const job = (async () => {
+    // Split long text safely into <=850 char batches (handling single giant paragraphs too)
+    const paras = text.replace(/\r\n/g, "\n").split(/\n{2,}/);
+    const batches = [];
+    let cur = "";
+    for (const p of paras) {
+      const part = p.trim();
+      if (!part) continue;
+      if (part.length > 850) {
+        if (cur) {
+          batches.push(cur);
+          cur = "";
+        }
+        for (const sub of splitTextByLimit(part, 850)) batches.push(sub);
+      } else if (cur && cur.length + part.length + 2 > 850) {
         batches.push(cur);
-        cur = "";
+        cur = part;
+      } else {
+        cur = cur ? `${cur}\n\n${part}` : part;
       }
-      for (const sub of splitTextByLimit(part, 850)) batches.push(sub);
-    } else if (cur && cur.length + part.length + 2 > 850) {
-      batches.push(cur);
-      cur = part;
-    } else {
-      cur = cur ? `${cur}\n\n${part}` : part;
     }
-  }
-  if (cur) batches.push(cur);
+    if (cur) batches.push(cur);
 
-  const outParts = [];
-  for (const b of batches) {
-    const tr = await translateChunkFree(b);
-    outParts.push(tr);
+    const outParts = [];
+    for (const b of batches) {
+      const tr = await translateChunkFree(b);
+      outParts.push(tr);
+    }
+    const translated = outParts.join("\n\n");
+    translateCache[hash] = translated;
+    saveTranslateCache();
+    return { translated, cached: false };
+  })();
+
+  inflightTranslations.set(hash, job);
+  try {
+    return await job;
+  } finally {
+    inflightTranslations.delete(hash);
   }
-  const translated = outParts.join("\n\n");
-  translateCache[hash] = translated;
-  saveTranslateCache();
-  return { translated, cached: false };
 }
 
 const DEFAULT_SNIPPETS = [
