@@ -1,0 +1,13 @@
+{
+  "name": "agy-web",
+  "version": "1.0.0",
+  "description": "Antigravity CLI (agy) 零依赖本地网页外壳，默认展开完整思考过程并支持精准翻译思考块",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js --open",
+    "serve": "node server.js"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
