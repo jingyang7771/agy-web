@@ -9,6 +9,18 @@
 
 ---
 
+## 界面预览
+
+### 1. 主工作台（全中文界面 · 思考译为中文 · 沙箱与自动模式 · 工具输出与变更角标）
+
+![Antigravity CLI Web 主界面](./docs/preview-main.png)
+
+### 2. 发送内容与上下文透视（按对话轮次还原用户输入与系统暗中注入）
+
+![发送内容与上下文透视 Inspector](./docs/preview-inspector.png)
+
+---
+
 ## 为什么选择 `agy-web`？（对比官方原生 CLI）
 
 | 维度 | 官方原生 CLI (`agy`) | `agy-web` |
